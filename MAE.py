@@ -364,156 +364,27 @@ class ViTDecoder(nn.Module):
 
         return x
 
-## Vision Transformer as the Encoder and Decoder implementation
+### Masked Autoencoder proper
 
-class AttentionBlock(nn.Module):
-    embed_dim: int
-    hidden_dim: int
-    num_heads: int
-    dropout_prob: float = 0.0
+class MaskedAutoencoderViT(nn.Module):
+    """ Masked Autoencoder with VisionTransformer backbone
+    """
 
-    def setup(self):
-        self.attn = nn.MultiHeadDotProductAttention(num_heads=self.num_heads)
-        self.linear = [
-            nn.Dense(self.hidden_dim),
-            nn.gelu,
-            nn.Dropout(self.dropout_prob),
-            nn.Dense(self.embed_dim),
-        ]
-        self.layer_norm_1 = nn.LayerNorm()
-        self.layer_norm_2 = nn.LayerNorm()
-        self.dropout = nn.Dropout(self.dropout_prob)
+    encoder: ViTEncoder
+    decoder: ViTDecoder
 
-    def __call__(self, x, train: bool = True):
-        inp_x = self.layer_norm_1(x)
-        attn_out = self.attn(inputs_q=inp_x, inputs_kv=inp_x)
-        x = x + self.dropout(attn_out, deterministic=not train)
+    def __call__(self, inputs, train: bool = True):
+        # We now call the encoder to get a representation of visible patches
+        encoded_x, mask, ids_restore = self.encoder(inputs, train=train)
 
-        linear_out = self.layer_norm_2(x)
-        for layer in self.linear:
-            linear_out = layer(linear_out) if not isinstance(layer, nn.Dropout) else layer(linear_out, deterministic=not train)
-        x = x + self.dropout(linear_out, deterministic=not train)
-        return x
+        # Then the decoder gives a reconstructed version of the patches
+        prediction = self.decoder(encoded_x, mask, ids_restore, train=train)
 
-
-class ViTEncoder(nn.Module):
-    embed_dim: int
-    hidden_dim: int
-    num_heads: int
-    num_layers: int
-    patch_size: int
-    num_patches: int
-    num_channels: int = 3
-    dropout_prob: float = 0.0
-
-    def setup(self):
-        # Layers/Networks
-        self.input_layer = nn.Dense(self.embed_dim)
-        self.transformer = [AttentionBlock(self.embed_dim,
-                                           self.hidden_dim,
-                                           self.num_heads,
-                                           self.dropout_prob) for _ in range(self.num_layers)]
-
-
-        ## Since this Transformer will only perform encoding, a classification head as well as classification
-        ## tokens are not necessary in this case
-
-        self.dropout = nn.Dropout(self.dropout_prob)
-
-        ## Parameters/Embeddings
-
-        self.pos_embedding = self.param('pos_embedding',
-                                        nn.initializers.normal(stddev=0.02),
-                                        (1, 1+self.num_patches, self.embed_dim))
-
-        self.cls_token = self.param('cls_token',
-                               nn.initializers.normal(stddev=0.02),
-                               (1, 1, self.embed_dim))
-
-    def __call__(self, x, train:bool = True):
-        # Patchify and embed the input
-        x = patchify(x, self.patch_size)
-        x = self.input_layer(x)
-
-        # Mask input patches
-        rng = self.make_rng('random_masking')
-        x, mask, ids_restore = random_masking(x, rng=rng)
-
-        # Add positional encoding and append CLS token
-        cls_token = self.cls_token.repeat(x.shape[0], axis=0)
-        x = jnp.concatenate([cls_token, x], axis=1)
-        x = x + self.pos_embedding[:, :x.shape[1]]
-
-        # Apply Transformer
-        x = self.dropout(x, deterministic=not train)
-        for block in self.transformer:
-            x = block(x, train=train)
-
-        return x, mask, ids_restore
-
-
-class ViTDecoder(nn.Module):
-    embed_dim: int # Not necessarily the same as used in the encoder
-    hidden_dim: int
-    num_heads: int
-    num_layers: int
-    num_patches: int
-    patch_size: int
-    num_channels: int = 3
-    dropout_prob: float = 0.0
-
-    def setup(self):
-        # Output dimension as a patch
-        self.output_dim = self.patch_size**2 * self.num_channels
-
-        # Layers/Networks
-        self.input_layer = nn.Dense(self.embed_dim)
-        self.transformer = [AttentionBlock(self.embed_dim, self.hidden_dim, self.num_heads, self.dropout_prob) for _ in range(self.num_layers)]
-
-        self.pred_head = nn.Sequential([
-            nn.LayerNorm(),
-            nn.Dense(self.output_dim)])
-
-        self.dropout = nn.Dropout(self.dropout_prob)
-
-        # Paramters/Embeddings
-        self.mask_token = self.param('mask_token',
-                                     nn.initializers.normal(stddev=0.02),
-                                     (1, 1, self.embed_dim))
-        self.pos_embedding = self.param('pos_embedding',
-                                        nn.initializers.normal(stddev=0.02),
-                                        (1, 1 +  self.num_patches, self.embed_dim)) # Taking into account the cls token
-
-
-
-    def __call__(self, x, mask, ids_restore, train):
-        # Embedding for the encoder
-        x = self.input_layer(x)
-
-        # Add mask tokens to the encoded sequence
-        mask_tokens = jnp.broadcast_to(self.mask_token,
-                                       (x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], x.shape[-1]))
-        x_ = jnp.concatenate([jnp.expand_dims(x[:, 1, :], axis=1), mask_tokens], axis=1) # jnp.expand dim is added to address mismatch shapes during concatenation
-        x_ = batched_gather(x_, ids_restore)
-        x = jnp.concatenate([x[:, :1, :], x_], axis=1)
-
-        # Add positional embeddings
-        x = x + self.pos_embedding[:, :x.shape[1]]
-
-        # Apply transformer blocks
-        for block in self.transformer:
-            x = block(x, train=train)
-
-        # Reconstruct patches
-        x = self.pred_head(x)
-
-        # Remove cls token and unpatchify result
-        x = x[:, 1:, :]
-        x = unpatchify(x, self.patch_size, (x.shape[0], 32, 32, 3))
-
-        return x
+        return prediction
+        
 
 ### Test MAE Implementation
+
 encoder = ViTEncoder(
     embed_dim=768, # one-fourth of the number of total pixels, the amount unmasked
     hidden_dim=512,
